@@ -1,142 +1,61 @@
 // server.js
-
 import express from "express";
-import cors from "cors";
 import dotenv from "dotenv";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
-/* ===============================
-   MIDDLEWARE
-================================ */
-app.use(cors());
 app.use(express.json());
 
-/* ===============================
-   GEMINI SETUP
-================================ */
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-
-const model = genAI.getGenerativeModel({
-  model: "gemini-2.5-flash"
+// Test route
+app.get("/", (req, res) => {
+  res.send("Backend is live!");
 });
 
-/* ===============================
-   YOUR PLAN SYSTEM (FREE / PRO)
-================================ */
-const SAFE_LIMITS = {
-  free: {
-    RPD: 10, // half of Gemini free tier (your idea)
-    RPM: 2
-  },
-  pro: {
-    RPD: 18,
-    RPM: 4
-  }
-};
+// Gemini setup
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-/* ===============================
-   IN-MEMORY USAGE TRACKER
-================================ */
-const usageStore = {};
-
-/* ===============================
-   LIMITER MIDDLEWARE
-================================ */
-function usageLimiter(req, res, next) {
-  const userId = req.body.userId || "guest";
-  const plan = req.body.plan === "pro" ? "pro" : "free";
-  const today = new Date().toISOString().split("T")[0];
-  const now = Date.now();
-
-  if (!usageStore[userId] || usageStore[userId].date !== today) {
-    usageStore[userId] = {
-      date: today,
-      daily: 0,
-      minute: [],
-      plan
-    };
-  }
-
-  const limits = SAFE_LIMITS[plan];
-
-  // Clean old RPM timestamps
-  usageStore[userId].minute = usageStore[userId].minute.filter(
-    t => now - t < 60000
-  );
-
-  if (usageStore[userId].minute.length >= limits.RPM) {
-    return res.json({
-      reply: "✔️ Too many requests. Please wait a moment 😊"
-    });
-  }
-
-  if (usageStore[userId].daily >= limits.RPD) {
-    return res.json({
-      reply:
-        plan === "free"
-          ? "✔️ Free daily limit reached 😊 Upgrade to PRO."
-          : "✔️ Daily limit reached 😊 Try again tomorrow."
-    });
-  }
-
-  usageStore[userId].minute.push(now);
-  usageStore[userId].daily++;
-
-  next();
-}
-
-/* ===============================
-   CHAT API (USED BY FRONTEND)
-================================ */
-app.post("/api/chat", usageLimiter, async (req, res) => {
+// Chat API
+app.post("/api/chat", async (req, res) => {
   try {
-    const userMessage = req.body.message;
+    const { message } = req.body;
 
-    if (!userMessage) {
-      return res.json({
-        reply: "Please type something 😊"
-      });
+    if (!message) {
+      return res.json({ reply: "Please send a message." });
     }
 
-    const result = await model.generateContent(userMessage);
+    const model = genAI.getGenerativeModel({
+      model: "gemini-2.5-flash"
+    });
+
+    const result = await model.generateContent(message);
 
     const reply =
       result?.response?.text?.() ||
       result?.response?.candidates?.[0]?.content?.parts?.[0]?.text;
 
+    // Only fallback — NOT a limit message
     if (!reply) {
       return res.json({
-        reply: "I’m a bit tired right now 😊 Please try again later."
+        reply: "Sorry, I couldn’t generate a reply. Please try again."
       });
     }
 
     res.json({ reply });
 
   } catch (error) {
-    console.error("Gemini error:", error);
+    console.error("Gemini error:", error.message);
 
     res.json({
-      reply:
-        "✔️ Connection error 😊 Free-tier limit may be exhausted."
+      reply: "Something went wrong. Please try again later."
     });
   }
 });
 
-/* ===============================
-   HEALTH CHECK
-================================ */
-app.get("/", (req, res) => {
-  res.send("MORADO AI backend is live 🚀");
-});
-
-/* ===============================
-   START SERVER
-================================ */
+// Start server
 app.listen(PORT, () => {
-  console.log(`✅ Server running on http://localhost:${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
