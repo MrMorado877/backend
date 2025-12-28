@@ -11,10 +11,9 @@ app.use(express.json());
 
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 
-// Chat route
+/* CHAT */
 app.post("/api/chat", async (req, res) => {
   const userMsg = req.body.message;
-  console.log("User:", userMsg);
 
   try {
     const response = await fetch(
@@ -23,13 +22,11 @@ app.post("/api/chat", async (req, res) => {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${OPENAI_KEY}`
+          Authorization: `Bearer ${OPENAI_KEY}`
         },
         body: JSON.stringify({
-          model: "gpt-4o-mini", // fast + cheap
-          messages: [
-            { role: "user", content: userMsg }
-          ]
+          model: "gpt-4o-mini",
+          messages: [{ role: "user", content: userMsg }]
         })
       }
     );
@@ -38,17 +35,17 @@ app.post("/api/chat", async (req, res) => {
 
     const reply =
       data?.choices?.[0]?.message?.content ||
-      "Sorry, I could not generate a reply.";
+      "No response";
 
     res.json({ reply });
 
   } catch (err) {
-    console.error("Chat Error:", err);
-    res.json({ reply: "AI ERROR" });
+    console.error(err);
+    res.status(500).json({ reply: "Server error" });
   }
 });
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () =>
-  console.log("Backend running on PORT " + PORT + " (OpenAI)")
+  console.log("Backend running on port " + PORT)
 );
