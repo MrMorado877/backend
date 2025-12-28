@@ -1,61 +1,88 @@
-// server.js
 import express from "express";
+import cors from "cors";
 import dotenv from "dotenv";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import OpenAI from "openai";
 
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-
+app.use(cors());
 app.use(express.json());
 
-// Test route
-app.get("/", (req, res) => {
-  res.send("Backend is live!");
+const client = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
 });
 
-// Gemini setup
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const SYSTEM_PROMPT = `
+You are Nexora, a professional-grade artificial intelligence system.
 
-// Chat API
+You operate as a high-precision digital consultant whose purpose is to deliver
+clear, structured, and authoritative responses.
+
+MANDATORY RULES:
+- Use a formal, professional, and confident tone
+- Structure explanations using headings and paragraphs
+- Preserve logical flow and spacing
+- Avoid casual language or filler phrases
+- Do not describe yourself generically as "an AI language model"
+- Do not mention training data unless explicitly requested
+- Explain complex ideas step-by-step
+- State limitations clearly when relevant
+- Prioritize accuracy, clarity, and usefulness
+- When appropriate, suggest concise next steps
+
+Never compress ideas into a single paragraph.
+Never remove paragraph breaks.
+`;
+
+/* ========== STREAMING CHAT ENDPOINT ========== */
+
 app.post("/api/chat", async (req, res) => {
   try {
-    const { message } = req.body;
+    const { message, history = [] } = req.body;
 
     if (!message) {
-      return res.json({ reply: "Please send a message." });
+      return res.status(400).json({ error: "Message is required" });
     }
 
-    const model = genAI.getGenerativeModel({
-      model: "gemini-2.5-flash"
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+
+    const stream = await client.chat.completions.create({
+      model: "gpt-4.1-mini",
+      temperature: 0.3,
+      top_p: 0.9,
+      presence_penalty: 0.2,
+      frequency_penalty: 0.2,
+      stream: true,
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        ...history,
+        {
+          role: "user",
+          content: `Answer the following with professional clarity and structured reasoning:\n\n${message}`
+        }
+      ]
     });
 
-    const result = await model.generateContent(message);
-
-    const reply =
-      result?.response?.text?.() ||
-      result?.response?.candidates?.[0]?.content?.parts?.[0]?.text;
-
-    // Only fallback — NOT a limit message
-    if (!reply) {
-      return res.json({
-        reply: "Sorry, I couldn’t generate a reply. Please try again."
-      });
+    for await (const chunk of stream) {
+      const token = chunk.choices[0]?.delta?.content;
+      if (token) {
+        res.write(`data: ${token}\n\n`);
+      }
     }
 
-    res.json({ reply });
+    res.write("data: [DONE]\n\n");
+    res.end();
 
-  } catch (error) {
-    console.error("Gemini error:", error.message);
-
-    res.json({
-      reply: "Something went wrong. Please try again later."
-    });
+  } catch (err) {
+    console.error(err);
+    res.write(`data: Error occurred\n\n`);
+    res.end();
   }
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+app.listen(process.env.PORT, () => {
+  console.log(`Nexora backend running on port ${process.env.PORT}`);
 });
