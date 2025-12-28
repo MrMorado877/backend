@@ -31,26 +31,31 @@ app.post("/api/chat", async (req, res) => {
     // Initialize session memory
     if (!sessions[sessionId]) sessions[sessionId] = [];
 
-    // Save user message
+    // 1️⃣ Reinforce identity before each user message
+    sessions[sessionId].push({
+      role: "user",
+      content: "Reminder: You are NEXORA AI. NEVER say ChatGPT or OpenAI. Always respond as NEXORA AI."
+    });
+
+    // 2️⃣ Save actual user message
     sessions[sessionId].push({ role: "user", content: message });
 
-    // Strict system prompt to enforce NEXORA identity
-    const messages = [
-      {
-        role: "system",
-        content: `
-You are NEXORA AI, a professional, concise, and helpful AI assistant created by the user.
-You MUST NEVER say you are ChatGPT or OpenAI.
-Always refer to yourself as NEXORA AI.
-Answer in a structured, friendly, conversational style.
-Use short paragraphs and separate them with lines if necessary.
-Maintain context from previous messages in the session.
-Never mention ChatGPT or OpenAI under any circumstances.`
-      },
-      ...sessions[sessionId] // include previous messages
-    ];
+    // 3️⃣ Strict system prompt
+    const systemMessage = {
+      role: "system",
+      content: `
+You are NEXORA AI, a professional, concise, friendly AI assistant created by the user.
+NEVER say you are ChatGPT or OpenAI.
+Always respond as NEXORA AI.
+If asked "Who are you?", respond: "I am NEXORA AI, your assistant."
+Use short paragraphs separated by horizontal lines.
+Always maintain context from previous messages.`
+    };
 
-    // Call OpenAI Chat API
+    // 4️⃣ Build messages array
+    const messages = [systemMessage, ...sessions[sessionId]];
+
+    // 5️⃣ Call OpenAI Chat API
     const completion = await openai.chat.completions.create({
       model: "gpt-3.5-turbo",
       messages: messages,
@@ -58,11 +63,15 @@ Never mention ChatGPT or OpenAI under any circumstances.`
       max_tokens: 500
     });
 
-    const reply = completion.choices[0].message.content;
+    let reply = completion.choices[0].message.content;
 
-    // Save AI reply to session
+    // 6️⃣ Optional safety: replace any ChatGPT mentions
+    reply = reply.replace(/ChatGPT/gi, "NEXORA AI").replace(/OpenAI/gi, "");
+
+    // 7️⃣ Save AI reply to session
     sessions[sessionId].push({ role: "assistant", content: reply });
 
+    // 8️⃣ Return reply
     res.json({ reply });
   } catch (err) {
     console.error(err);
