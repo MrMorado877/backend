@@ -1,170 +1,157 @@
-// ====== VARIABLES ======
-const backend = "https://backend-b80q.onrender.com/api/chat";
-const sidebar = document.getElementById("sidebar");
-const main = document.getElementById("main");
-const chatArea = document.getElementById("chatArea");
-const input = document.getElementById("input");
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import pkg from "pg";
+import OpenAI from "openai";
 
-let chats = JSON.parse(localStorage.getItem("nexoraChats") || "[]");
-let currentChat = null;
+dotenv.config();
+const { Pool } = pkg;
 
-// ====== SIDEBAR ======
-function toggleSidebar() {
-  sidebar.classList.toggle("closed");
-  main.classList.toggle("full");
-}
+const app = express();
+app.use(cors());
+app.use(express.json());
 
-// Sidebar default closed
-sidebar.classList.add("closed");
-main.classList.add("full");
-
-// ====== THEME ======
-function toggleTheme() {
-  document.body.classList.toggle("light");
-}
-
-// ====== CHAT MANAGEMENT ======
-function save() {
-  localStorage.setItem("nexoraChats", JSON.stringify(chats));
-}
-
-function newChat() {
-  currentChat = { id: Date.now(), title: "New Chat", messages: [] };
-  chats.unshift(currentChat);
-  save();
-  renderTitles();
-  loadChat(currentChat);
-}
-
-function renderTitles() {
-  const box = document.getElementById("chatTitles");
-  box.innerHTML = "";
-  chats.forEach(c => {
-    const d = document.createElement("div");
-    d.className = "chat-title";
-    d.textContent = c.title;
-    d.onclick = () => loadChat(c);
-    box.appendChild(d);
-  });
-}
-
-function loadChat(chat) {
-  currentChat = chat;
-  chatArea.innerHTML = "";
-  chat.messages.forEach(m => addMessage(m.text, m.role, false));
-}
-
-// ====== MESSAGES ======
-function addMessage(text, role, store = true) {
-  const d = document.createElement("div");
-  d.className = `message ${role}`;
-  d.innerHTML = marked.parse(text);
-  chatArea.appendChild(d);
-  chatArea.scrollTop = chatArea.scrollHeight;
-
-  if (store) {
-    currentChat.messages.push({ role, text });
-    if (currentChat.messages.length === 1) {
-      currentChat.title = text.slice(0, 25);
-      renderTitles();
-    }
-    save();
-  }
-  return d;
-}
-
-// ====== TYPING EFFECT WITH PARAGRAPH SEPARATION ======
-function typeEffect(el, text) {
-  el.innerHTML = "";
-
-  const paragraphs = text.split("\n\n");
-  let paraIndex = 0;
-
-  function typeParagraph() {
-    if (paraIndex >= paragraphs.length) return;
-
-    let words = paragraphs[paraIndex].split(" ");
-    let i = 0;
-
-    const t = setInterval(() => {
-      if (i < words.length) {
-        el.innerHTML += words[i] + " ";
-        chatArea.scrollTop = chatArea.scrollHeight;
-        i++;
-      } else {
-        clearInterval(t);
-        paraIndex++;
-        if (paraIndex < paragraphs.length) {
-          el.innerHTML += "<hr>";
-          typeParagraph();
-        }
-      }
-    }, 40);
-  }
-
-  typeParagraph();
-}
-
-// ====== SEND MESSAGE ======
-input.addEventListener("keydown", e => {
-  if (e.key === "Enter") sendMessage();
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false
 });
 
-async function sendMessage() {
-  if (!currentChat) newChat();
-  const msg = input.value.trim();
-  if (!msg) return;
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
 
-  addMessage(msg, "user");
-  input.value = "";
+/* ------------------- DB Helpers ------------------- */
 
-  const botDiv = document.createElement("div");
-  botDiv.className = "message bot";
-  chatArea.appendChild(botDiv);
+async function getUser(email) {
+  const q = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
+  if (q.rows.length) return q.rows[0];
 
-  chatArea.scrollTop = chatArea.scrollHeight;
+  const ins = await pool.query(
+    "INSERT INTO users (email) VALUES ($1) RETURNING *",
+    [email]
+  );
+  return ins.rows[0];
+}
 
-  // Typing sound
-  const typingSound = new Audio("/sounds/type.mp3");
-  typingSound.loop = true;
-  typingSound.play();
+async function getLatestChat(userId) {
+  const q = await pool.query(
+    "SELECT * FROM chats WHERE user_id=$1 ORDER BY id DESC LIMIT 1",
+    [userId]
+  );
+  if (q.rows.length) return q.rows[0];
 
+  const ins = await pool.query(
+    "INSERT INTO chats (user_id,title) VALUES ($1,'New Chat') RETURNING *",
+    [userId]
+  );
+  return ins.rows[0];
+}
+
+/* ------------------- AI Chat ------------------- */
+
+app.post("/api/chat", async (req, res) => {
   try {
-    const response = await fetch(backend, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        message: msg,
-        sessionId: currentChat.id
-      })
-    });
+    const { email, message, language } = req.body;
+    if (!email || !message) return res.status(400).json({ error: "Missing data" });
 
-    const data = await response.json();
-    typingSound.pause();
-    typingSound.currentTime = 0;
+    const user = await getUser(email);
+    const chat = await getLatestChat(user.id);
 
-    typeEffect(botDiv, data.reply);
-    currentChat.messages.push({ role: "bot", text: data.reply });
-    save();
+    await pool.query(
+      "INSERT INTO messages (chat_id,sender,content) VALUES ($1,'user',$2)",
+      [chat.id, message]
+    );
+
+    let reply;
+
+    try {
+      const ai = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: `You are Nexora AI. Reply in ${language || "English"} with friendly tone, emojis and line breaks.` },
+          { role: "user", content: message }
+        ]
+      });
+
+      reply = ai.choices[0].message.content;
+    } catch (err) {
+      console.log("⚠️ OpenAI fallback used");
+      reply = `🤖 Nexora (offline)\n\nYou said:\n"${message}"\n\nTry again later 😊`;
+    }
+
+    await pool.query(
+      "INSERT INTO messages (chat_id,sender,content) VALUES ($1,'bot',$2)",
+      [chat.id, reply]
+    );
+
+    res.json({ reply });
 
   } catch (err) {
-    typingSound.pause();
-    typingSound.currentTime = 0;
-    botDiv.textContent = "Server error";
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
   }
-}
-
-// ====== MOBILE SWIPE FOR SIDEBAR ======
-let startX = 0;
-document.addEventListener("touchstart", e => startX = e.touches[0].clientX);
-document.addEventListener("touchend", e => {
-  let endX = e.changedTouches[0].clientX;
-  if (endX - startX > 80) sidebar.classList.remove("closed"), main.classList.remove("full");
-  if (startX - endX > 80) sidebar.classList.add("closed"), main.classList.add("full");
 });
 
-// ====== INIT ======
-if (chats.length) {
-  loadChat(chats[0]);
-  renderTitles();
-}
+/* ------------------- Chat Titles ------------------- */
+
+app.post("/api/chat/titles", async (req, res) => {
+  try {
+    const { email } = req.body;
+    const user = await getUser(email);
+
+    const q = await pool.query(
+      "SELECT id,title FROM chats WHERE user_id=$1 ORDER BY id DESC",
+      [user.id]
+    );
+
+    res.json({ titles: q.rows });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* ------------------- Chat History ------------------- */
+
+app.post("/api/chat/history", async (req, res) => {
+  try {
+    const { chatId } = req.body;
+
+    const q = await pool.query(
+      "SELECT sender,content FROM messages WHERE chat_id=$1 ORDER BY id",
+      [chatId]
+    );
+
+    res.json({ history: q.rows });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* ------------------- Rename Chat ------------------- */
+
+app.post("/api/chat/rename", async (req, res) => {
+  const { chatId, newTitle } = req.body;
+  await pool.query("UPDATE chats SET title=$1 WHERE id=$2", [newTitle, chatId]);
+  res.json({ success: true });
+});
+
+/* ------------------- Delete Chat ------------------- */
+
+app.post("/api/chat/delete", async (req, res) => {
+  const { chatId } = req.body;
+  await pool.query("DELETE FROM chats WHERE id=$1", [chatId]);
+  res.json({ success: true });
+});
+
+/* ------------------- Health Check ------------------- */
+
+app.get("/", (req,res)=>{
+  res.send("Nexora AI Backend Live 🚀");
+});
+
+/* ------------------- Server ------------------- */
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log("🚀 Nexora backend running on port", PORT);
+});
