@@ -1,124 +1,102 @@
 // server.js
-import express from "express";
-import cors from "cors";
-import dotenv from "dotenv";
-import { Pool } from "pg";
-import OpenAI from "openai";
-
-dotenv.config();
+const express = require("express");
+const cors = require("cors");
+const bodyParser = require("body-parser");
+const { v4: uuidv4 } = require("uuid");
+const { Configuration, OpenAIApi } = require("openai");
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+const PORT = process.env.PORT || 3000;
 
-// PostgreSQL local or Render URL
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
-});
+// Middleware
+app.use(cors()); // For production, you can set origin to your front-end URL
+app.use(bodyParser.json());
+app.use(express.static("public")); // serve front-end files
 
 // OpenAI setup
-const openai = new OpenAI({
+const configuration = new Configuration({
   apiKey: process.env.OPENAI_API_KEY
 });
+const openai = new OpenAIApi(configuration);
 
-// Test route
-app.get("/api/test", (req, res) => {
-  res.json({ message: "Backend is alive 🚀" });
+// In-memory chat storage (replace with DB if needed)
+let chats = {}; // { email: [{ id, title, history: [{ sender, content }] }] }
+
+// Helper to generate chat title
+function generateTitle(message) {
+  return message.length > 20 ? message.slice(0, 20) + "..." : message;
+}
+
+// Routes
+
+// 1️⃣ Get chat titles
+app.post("/api/chat/titles", (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "Email required" });
+
+  const userChats = chats[email] || [];
+  const titles = userChats.map(chat => ({ id: chat.id, title: chat.title }));
+  res.json({ titles });
 });
 
-// Fetch chat titles for a user
-app.post("/api/chat/titles", async (req, res) => {
-  try {
-    const { email } = req.body;
-    const result = await pool.query(
-      `SELECT id, title, created_at 
-       FROM chats 
-       WHERE user_email = $1 
-       ORDER BY created_at DESC`,
-      [email]
-    );
-    res.json({ titles: result.rows });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to fetch chat titles" });
+// 2️⃣ Get chat history
+app.post("/api/chat/history", (req, res) => {
+  const { chatId } = req.body;
+  if (!chatId) return res.status(400).json({ error: "Chat ID required" });
+
+  let found = null;
+  for (let email in chats) {
+    found = chats[email].find(chat => chat.id === chatId);
+    if (found) break;
   }
+  if (!found) return res.status(404).json({ error: "Chat not found" });
+
+  res.json({ history: found.history });
 });
 
-// Fetch chat history for a chatId
-app.post("/api/chat/history", async (req, res) => {
-  try {
-    const { chatId } = req.body;
-    const result = await pool.query(
-      `SELECT sender, content, created_at 
-       FROM messages 
-       WHERE chat_id = $1 
-       ORDER BY created_at ASC`,
-      [chatId]
-    );
-    res.json({ history: result.rows });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to fetch chat history" });
-  }
-});
-
-// Send message and get AI reply
+// 3️⃣ Send message and get GPT reply
 app.post("/api/chat", async (req, res) => {
   try {
-    const { message, email } = req.body;
+    const { email, message } = req.body;
+    if (!email || !message) return res.status(400).json({ error: "Email and message required" });
 
-    // Check user
-    let userRes = await pool.query("SELECT id FROM users WHERE email=$1", [email]);
-    let userId;
-    if (userRes.rows.length === 0) {
-      const insertUser = await pool.query(
-        "INSERT INTO users (name, email, created_at) VALUES ($1,$2,NOW()) RETURNING id",
-        ["Anonymous", email]
-      );
-      userId = insertUser.rows[0].id;
-    } else {
-      userId = userRes.rows[0].id;
+    if (!chats[email]) chats[email] = [];
+    let chat = chats[email].length ? chats[email][chats[email].length - 1] : null;
+
+    if (!chat) {
+      const id = uuidv4();
+      chat = { id, title: generateTitle(message), history: [] };
+      chats[email].push(chat);
     }
 
-    // Create chat
-    const chatTitle = message.length > 20 ? message.substring(0, 20) + "..." : message;
-    const chatInsert = await pool.query(
-      "INSERT INTO chats (user_email, title, created_at) VALUES ($1,$2,NOW()) RETURNING id",
-      [email, chatTitle]
-    );
-    const chatId = chatInsert.rows[0].id;
-
     // Save user message
-    await pool.query(
-      "INSERT INTO messages (chat_id,sender,content,created_at) VALUES ($1,$2,$3,NOW())",
-      [chatId, "user", message]
-    );
+    chat.history.push({ sender: "user", content: message });
 
-    // OpenAI GPT-4 reply
-    const aiRes = await openai.chat.completions.create({
-      model: "gpt-4",
-      messages: [
-        { role: "system", content: "You are friendly AI. Answer in multi-line format with emojis." },
-        { role: "user", content: message }
-      ],
-      temperature: 0.7
+    // Build messages for OpenAI
+    const gptMessages = chat.history.map(msg => ({
+      role: msg.sender === "user" ? "user" : "assistant",
+      content: msg.content
+    }));
+
+    // Call OpenAI GPT
+    const completion = await openai.createChatCompletion({
+      model: "gpt-3.5-turbo",
+      messages: gptMessages
     });
 
-    const aiReply = aiRes.choices[0].message.content;
+    const reply = completion.data.choices[0].message.content;
 
-    // Save AI reply
-    await pool.query(
-      "INSERT INTO messages (chat_id,sender,content,created_at) VALUES ($1,$2,$3,NOW())",
-      [chatId, "bot", aiReply]
-    );
+    // Save bot reply
+    chat.history.push({ sender: "bot", content: reply });
 
-    res.json({ reply: aiReply, chatId, title: chatTitle });
-  } catch (err) {
-    console.error("Server error:", err);
-    res.status(500).json({ error: "Server error. Please try again later." });
+    res.json({ reply });
+  } catch (error) {
+    console.error("Error:", error);
+    res.status(500).json({ error: "Failed to get AI response" });
   }
 });
 
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`🚀 Nexora backend running on port ${PORT}`));
+// Start server
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
