@@ -5,116 +5,130 @@ import pkg from "pg";
 import OpenAI from "openai";
 
 dotenv.config();
-
 const { Pool } = pkg;
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Postgres connection using DATABASE_URL from Render env
+/* ================= DATABASE ================= */
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }, // needed for Render Postgres
+  ssl: process.env.DATABASE_URL.includes("render.com")
+    ? { rejectUnauthorized: false }
+    : false
 });
 
-// OpenAI client
+pool.connect()
+  .then(() => console.log("✅ PostgreSQL connected"))
+  .catch(err => console.error("❌ DB error", err));
+
+/* ================= OPENAI ================= */
 const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
+  apiKey: process.env.OPENAI_API_KEY
 });
 
-// --- TEST ROUTE ---
-app.get("/api/test", (req, res) => {
-  res.json({ message: "Backend alive 🚀" });
-});
+const NEXORA_PROMPT = `
+You are Nexora AI, created by Morado.
+You are not ChatGPT.
+You are not OpenAI.
+You must identify yourself only as Nexora AI.
+`;
 
-// --- CHAT ENDPOINT ---
-app.post("/api/chat", async (req, res) => {
+/* ================= LOGIN ================= */
+app.post("/api/login", async (req, res) => {
+  const { email, name, picture } = req.body;
+
   try {
-    const { message, language, email } = req.body;
-    if (!email) return res.status(400).json({ error: "User email required" });
-
-    // Optional: Store message in DB
-    const chatRes = await pool.query(
-      "INSERT INTO messages (user_email, sender, content) VALUES ($1,$2,$3) RETURNING id",
-      [email, "user", message]
+    await pool.query(
+      `INSERT INTO users (email, name, picture)
+       VALUES ($1,$2,$3)
+       ON CONFLICT (email) DO NOTHING`,
+      [email, name || "", picture || ""]
     );
-    const messageId = chatRes.rows[0].id;
 
-    // Call OpenAI API
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Login failed" });
+  }
+});
+
+/* ================= CHAT ================= */
+app.post("/api/chat", async (req, res) => {
+  const { email, message } = req.body;
+
+  try {
+    // FORCE user to exist (fixes foreign key crash)
+    await pool.query(
+      `INSERT INTO users (email)
+       VALUES ($1)
+       ON CONFLICT (email) DO NOTHING`,
+      [email]
+    );
+
+    // Create chat
+    const chat = await pool.query(
+      `INSERT INTO chats (user_email) VALUES ($1) RETURNING id`,
+      [email]
+    );
+
+    const chatId = chat.rows[0].id;
+
+    // Save user message
+    await pool.query(
+      `INSERT INTO messages (chat_id, role, content)
+       VALUES ($1,'user',$2)`,
+      [chatId, message]
+    );
+
+    // Call Nexora AI
     const completion = await openai.chat.completions.create({
-      model: "gpt-4",
+      model: "gpt-4o-mini",
       messages: [
-        { role: "system", content: `You are Nexora AI. Respond in ${language || "English"}` },
-        { role: "user", content: message },
-      ],
-      temperature: 0.7,
+        { role: "system", content: NEXORA_PROMPT },
+        { role: "user", content: message }
+      ]
     });
 
     const reply = completion.choices[0].message.content;
 
-    // Save bot reply
+    // Save Nexora reply
     await pool.query(
-      "INSERT INTO messages (user_email, sender, content) VALUES ($1,$2,$3)",
-      [email, "bot", reply]
+      `INSERT INTO messages (chat_id, role, content)
+       VALUES ($1,'assistant',$2)`,
+      [chatId, reply]
     );
 
     res.json({ reply });
+
   } catch (err) {
-    console.error("AI chat error:", err);
-    res.status(500).json({ error: "Server error" });
+    console.error("Chat failure:", err);
+    res.status(500).json({ error: "AI failed" });
   }
 });
 
-// --- CHAT HISTORY ---
+/* ================= HISTORY ================= */
 app.post("/api/history", async (req, res) => {
+  const { email } = req.body;
+
   try {
-    const { email, chatId } = req.body;
-    if (!email) return res.status(400).json({ error: "User email required" });
+    const data = await pool.query(`
+      SELECT m.role, m.content
+      FROM chats c
+      JOIN messages m ON c.id = m.chat_id
+      WHERE c.user_email = $1
+      ORDER BY m.created_at ASC
+    `, [email]);
 
-    let messages;
-    if (chatId) {
-      messages = await pool.query(
-        "SELECT id, sender, content, created_at FROM messages WHERE id=$1",
-        [chatId]
-      );
-    } else {
-      messages = await pool.query(
-        "SELECT id, sender, content, created_at FROM messages WHERE user_email=$1 ORDER BY created_at ASC",
-        [email]
-      );
-    }
-
-    res.json({ history: messages.rows });
+    res.json(data.rows);
   } catch (err) {
-    console.error("History error:", err);
-    res.status(500).json({ error: "Server error" });
+    res.status(500).json({ error: "History failed" });
   }
 });
 
-// --- CHAT TITLES ---
-app.post("/api/titles", async (req, res) => {
-  try {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ error: "User email required" });
-
-    const titlesRes = await pool.query(
-      `SELECT DISTINCT ON (id) id, content AS title, created_at 
-       FROM messages 
-       WHERE user_email=$1 AND sender='user' 
-       ORDER BY id DESC, created_at DESC`,
-      [email]
-    );
-
-    res.json({ titles: titlesRes.rows });
-  } catch (err) {
-    console.error("Titles error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// --- START SERVER ---
+/* ================= PORT ================= */
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`🚀 Nexora backend running on port ${PORT}`);
+  console.log("🚀 Nexora backend running on port", PORT);
 });
