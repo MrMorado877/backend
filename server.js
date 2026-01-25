@@ -1,134 +1,115 @@
 import express from "express";
 import cors from "cors";
-import dotenv from "dotenv";
-import pkg from "pg";
-import OpenAI from "openai";
-
-dotenv.config();
-const { Pool } = pkg;
+import fetch from "node-fetch";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-/* ================= DATABASE ================= */
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL.includes("render.com")
-    ? { rejectUnauthorized: false }
-    : false
+const PORT = process.env.PORT || 10000;
+
+/* ============================
+   In-Memory Storage
+============================ */
+
+const users = {};
+const chats = {};
+const messages = {};
+
+/* ============================
+   Health Check
+============================ */
+
+app.get("/", (req, res) => {
+  res.send("Nexora AI Backend is running");
 });
 
-pool.connect()
-  .then(() => console.log("✅ PostgreSQL connected"))
-  .catch(err => console.error("❌ DB error", err));
+/* ============================
+   Login
+============================ */
 
-/* ================= OPENAI ================= */
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
-
-const NEXORA_PROMPT = `
-You are Nexora AI, created by Morado.
-You are not ChatGPT.
-You are not OpenAI.
-You must identify yourself only as Nexora AI.
-`;
-
-/* ================= LOGIN ================= */
-app.post("/api/login", async (req, res) => {
+app.post("/login", (req, res) => {
   const { email, name, picture } = req.body;
 
-  try {
-    await pool.query(
-      `INSERT INTO users (email, name, picture)
-       VALUES ($1,$2,$3)
-       ON CONFLICT (email) DO NOTHING`,
-      [email, name || "", picture || ""]
-    );
+  if (!email) return res.status(400).json({ error: "Email required" });
 
-    res.json({ success: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Login failed" });
+  if (!users[email]) {
+    users[email] = { email, name, picture, createdAt: Date.now() };
   }
+
+  if (!chats[email]) {
+    chats[email] = [];
+  }
+
+  res.json({ success: true, user: users[email] });
 });
 
-/* ================= CHAT ================= */
-app.post("/api/chat", async (req, res) => {
+/* ============================
+   Get Chats
+============================ */
+
+app.get("/chats/:email", (req, res) => {
+  const { email } = req.params;
+  res.json(chats[email] || []);
+});
+
+/* ============================
+   Send Message to Nexora AI
+============================ */
+
+app.post("/chat", async (req, res) => {
   const { email, message } = req.body;
 
+  if (!email || !message) {
+    return res.status(400).json({ error: "Missing data" });
+  }
+
+  if (!chats[email]) chats[email] = [];
+  if (!messages[email]) messages[email] = [];
+
+  messages[email].push({ role: "user", content: message });
+
   try {
-    // FORCE user to exist (fixes foreign key crash)
-    await pool.query(
-      `INSERT INTO users (email)
-       VALUES ($1)
-       ON CONFLICT (email) DO NOTHING`,
-      [email]
-    );
-
-    // Create chat
-    const chat = await pool.query(
-      `INSERT INTO chats (user_email) VALUES ($1) RETURNING id`,
-      [email]
-    );
-
-    const chatId = chat.rows[0].id;
-
-    // Save user message
-    await pool.query(
-      `INSERT INTO messages (chat_id, role, content)
-       VALUES ($1,'user',$2)`,
-      [chatId, message]
-    );
-
-    // Call Nexora AI
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: NEXORA_PROMPT },
-        { role: "user", content: message }
-      ]
+    const aiResponse = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: "You are Nexora AI, an advanced helpful assistant." },
+          ...messages[email]
+        ]
+      })
     });
 
-    const reply = completion.choices[0].message.content;
+    const data = await aiResponse.json();
+    const reply = data.choices?.[0]?.message?.content || "No reply";
 
-    // Save Nexora reply
-    await pool.query(
-      `INSERT INTO messages (chat_id, role, content)
-       VALUES ($1,'assistant',$2)`,
-      [chatId, reply]
-    );
+    messages[email].push({ role: "assistant", content: reply });
+    chats[email].push({ user: message, ai: reply });
 
     res.json({ reply });
 
   } catch (err) {
-    console.error("Chat failure:", err);
-    res.status(500).json({ error: "AI failed" });
+    res.status(500).json({ error: "Nexora AI failed" });
   }
 });
 
-/* ================= HISTORY ================= */
-app.post("/api/history", async (req, res) => {
-  const { email } = req.body;
+/* ============================
+   Logout
+============================ */
 
-  try {
-    const data = await pool.query(`
-      SELECT m.role, m.content
-      FROM chats c
-      JOIN messages m ON c.id = m.chat_id
-      WHERE c.user_email = $1
-      ORDER BY m.created_at ASC
-    `, [email]);
-
-    res.json(data.rows);
-  } catch (err) {
-    res.status(500).json({ error: "History failed" });
-  }
+app.post("/logout", (req, res) => {
+  res.json({ success: true });
 });
 
-/* ================= PORT ================= */
-const PORT = process.env.PORT || 10000;
+/* ============================
+   Start Server
+============================ */
+
 app.listen(PORT, () => {
-  console.log("🚀 Nexora backend running on port", PORT);
+  console.log("🚀 Nexora backend running on port " + PORT);
 });
