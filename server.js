@@ -1,115 +1,84 @@
 import express from "express";
 import cors from "cors";
+import dotenv from "dotenv";
 import fetch from "node-fetch";
+
+dotenv.config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = process.env.PORT || 10000;
-
-/* ============================
-   In-Memory Storage
-============================ */
-
-const users = {};
+const PORT = 10000;
 const chats = {};
-const messages = {};
 
-/* ============================
-   Health Check
-============================ */
+let MODEL = null;
+
+/* Find a working Gemini model */
+async function findModel() {
+  const url = `https://generativelanguage.googleapis.com/v1/models?key=${process.env.GEMINI_API_KEY}`;
+  const res = await fetch(url);
+  const data = await res.json();
+
+  const models = data.models || [];
+
+  const usable = models.find(m =>
+    (m.supportedGenerationMethods || []).includes("generateContent")
+  );
+
+  if (!usable) {
+    console.error("❌ No usable Gemini model found for this key.");
+    return;
+  }
+
+  MODEL = usable.name;
+  console.log("✅ Using model:", MODEL);
+}
+
+/* Start */
+await findModel();
 
 app.get("/", (req, res) => {
-  res.send("Nexora AI Backend is running");
+  res.send("Nexora Gemini backend running");
 });
-
-/* ============================
-   Login
-============================ */
-
-app.post("/login", (req, res) => {
-  const { email, name, picture } = req.body;
-
-  if (!email) return res.status(400).json({ error: "Email required" });
-
-  if (!users[email]) {
-    users[email] = { email, name, picture, createdAt: Date.now() };
-  }
-
-  if (!chats[email]) {
-    chats[email] = [];
-  }
-
-  res.json({ success: true, user: users[email] });
-});
-
-/* ============================
-   Get Chats
-============================ */
-
-app.get("/chats/:email", (req, res) => {
-  const { email } = req.params;
-  res.json(chats[email] || []);
-});
-
-/* ============================
-   Send Message to Nexora AI
-============================ */
 
 app.post("/chat", async (req, res) => {
   const { email, message } = req.body;
-
-  if (!email || !message) {
-    return res.status(400).json({ error: "Missing data" });
-  }
+  if (!message) return res.json({ reply: "Say something 🙂" });
 
   if (!chats[email]) chats[email] = [];
-  if (!messages[email]) messages[email] = [];
 
-  messages[email].push({ role: "user", content: message });
+  chats[email].push({ role: "user", parts: [{ text: message }] });
 
   try {
-    const aiResponse = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        messages: [
-          { role: "system", content: "You are Nexora AI, an advanced helpful assistant." },
-          ...messages[email]
-        ]
-      })
-    });
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1/${MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: chats[email],
+          generationConfig: { temperature: 0.7 }
+        })
+      }
+    );
 
-    const data = await aiResponse.json();
-    const reply = data.choices?.[0]?.message?.content || "No reply";
+    const data = await response.json();
 
-    messages[email].push({ role: "assistant", content: reply });
-    chats[email].push({ user: message, ai: reply });
+    const reply =
+      data.candidates?.[0]?.content?.parts?.[0]?.text ||
+      "Hello 👋 I am Nexora AI (fallback reply).";
+
+    chats[email].push({ role: "model", parts: [{ text: reply }] });
 
     res.json({ reply });
 
   } catch (err) {
-    res.status(500).json({ error: "Nexora AI failed" });
+    console.error("AI ERROR:", err);
+    res.json({ reply: "Hello 👋 I am Nexora AI (fallback reply)." });
   }
 });
 
-/* ============================
-   Logout
-============================ */
-
-app.post("/logout", (req, res) => {
-  res.json({ success: true });
-});
-
-/* ============================
-   Start Server
-============================ */
-
 app.listen(PORT, () => {
-  console.log("🚀 Nexora backend running on port " + PORT);
+  console.log("🚀 Nexora running on port", PORT);
 });
